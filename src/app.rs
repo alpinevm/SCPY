@@ -221,25 +221,16 @@ fn LandingPage() -> impl IntoView {
                 }}
             </section>
 
-            <section class="hero-grid">
-                <div class="hero-copy card">
-                    <p class="eyebrow">"Fast and simple"</p>
-                    <h1>"Short links. Private text. Live sync."</h1>
-                    <p class="lead">
-                        "Set a password, share a short link, and keep typing. Anyone with both can unlock"
-                        " the clipboard and see the latest text."
-                    </p>
-                </div>
-
-                <div class="hero-preview card">
-                    <div class="preview-window">
-                        <div class="preview-stack">
-                            <div class="preview-note">
-                                {format!("scpy.app runs {} in the browser so the server only handles encrypted data.", cipher_suite_label())}
-                            </div>
-                        </div>
-                    </div>
-                </div>
+            <section class="hero-copy card">
+                <p class="eyebrow">"Fast and simple"</p>
+                <h1>"Short links. Private text. Live sync."</h1>
+                <p class="lead">
+                    "Set a password, share a short link, and keep typing. Anyone with both can unlock"
+                    " the clipboard and see the latest text."
+                </p>
+                <p class="security-copy">
+                    {format!("scpy.app runs {} in the browser so the server only handles encrypted data.", cipher_suite_label())}
+                </p>
             </section>
         </div>
     }
