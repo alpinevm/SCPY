@@ -208,6 +208,14 @@ textarea {
   line-height: 0.95;
 }
 
+.hero-stack-line {
+  display: block;
+}
+
+.hero-stack-line + .hero-stack-line {
+  margin-top: 0.14em;
+}
+
 .lead,
 .room-copy,
 .security-copy,
