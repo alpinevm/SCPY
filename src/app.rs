@@ -151,10 +151,6 @@ fn LandingPage() -> impl IntoView {
                     <div>
                         <p class="eyebrow">"Create"</p>
                         <h2 class="brand-name create-title">"Spin up an encrypted clipboard now."</h2>
-                        <p class="room-copy">
-                            "Set a password, share a short link, and keep typing. Anyone with both can unlock"
-                            " the clipboard and see the latest text."
-                        </p>
                     </div>
                     <div
                         class=("status-pill", true)
@@ -225,11 +221,13 @@ fn LandingPage() -> impl IntoView {
                 }}
             </section>
 
-            <section class="security-band card">
-                <div>
-                    <p class="eyebrow">"How it works"</p>
-                    <h2>"Share the link. Share the password separately."</h2>
-                </div>
+            <section class="hero-copy card">
+                <p class="eyebrow">"Fast and simple"</p>
+                <h1>"Short links. Private text. Live sync."</h1>
+                <p class="lead">
+                    "Set a password, share a short link, and keep typing. Anyone with both can unlock"
+                    " the clipboard and see the latest text."
+                </p>
                 <p class="security-copy">
                     {format!("scpy.app runs {} in the browser so the server only handles encrypted data.", cipher_suite_label())}
                 </p>
