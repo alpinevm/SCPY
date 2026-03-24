@@ -223,7 +223,13 @@ fn LandingPage() -> impl IntoView {
 
             <section class="hero-copy card">
                 <p class="eyebrow">"Fast and simple"</p>
-                <h1>"Short links. Private text. Live sync."</h1>
+                <h1>
+                    "Private text"
+                    <br/>
+                    "Live sync"
+                    <br/>
+                    "Short links"
+                </h1>
                 <p class="lead">
                     "Set a password, share a short link, and keep typing. Anyone with both can unlock"
                     " the clipboard and see the latest text."
