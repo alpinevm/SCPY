@@ -221,16 +221,45 @@ fn LandingPage() -> impl IntoView {
                 }}
             </section>
 
-            <section class="hero-copy card">
-                <p class="eyebrow">"Fast and simple"</p>
-                <h1>"Short links. Private text. Live sync."</h1>
-                <p class="lead">
-                    "Set a password, share a short link, and keep typing. Anyone with both can unlock"
-                    " the clipboard and see the latest text."
-                </p>
-                <p class="security-copy">
-                    {format!("scpy.app runs {} in the browser so the server only handles encrypted data.", cipher_suite_label())}
-                </p>
+            <section class="hero-grid">
+                <div class="hero-copy card">
+                    <p class="eyebrow">"Fast and simple"</p>
+                    <h1>"Short links. Private text. Live sync."</h1>
+                    <p class="lead">
+                        "Set a password, share a short link, and keep typing. Anyone with both can unlock"
+                        " the clipboard and see the latest text."
+                    </p>
+                </div>
+
+                <div class="hero-preview card">
+                    <div class="preview-window">
+                        <div class="preview-header">
+                            <span class="preview-dot dot-copper"></span>
+                            <span class="preview-dot dot-gold"></span>
+                            <span class="preview-dot dot-teal"></span>
+                            <span class="preview-title">"clip / 8F3kPq2WZa"</span>
+                        </div>
+
+                        <div class="preview-stack">
+                            <div class="preview-badge">"Shared text"</div>
+                            <p class="preview-copy">
+                                "Launch notes updated. Final copy is live for everyone already unlocked."
+                            </p>
+                            <div class="preview-divider"></div>
+                            <div class="preview-row">
+                                <span>"short link"</span>
+                                <span>"separate password"</span>
+                            </div>
+                            <div class="preview-row">
+                                <span>"encrypted before upload"</span>
+                                <span>"updates appear live"</span>
+                            </div>
+                            <div class="preview-note">
+                                {format!("scpy.app runs {} in the browser so the server only handles encrypted data.", cipher_suite_label())}
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </section>
         </div>
     }
