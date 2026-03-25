@@ -12,7 +12,7 @@ async fn main() {
 
     tracing_subscriber::fmt::init();
 
-    let conf = get_configuration(None).expect("failed to load Leptos configuration");
+    let conf = get_configuration(Some("Cargo.toml")).expect("failed to load Leptos configuration");
     let mut leptos_options = conf.leptos_options;
     let addr = env::var("PORT")
         .ok()
@@ -28,9 +28,18 @@ async fn main() {
     let redis_url = env::var("SCPY_REDIS_URL")
         .ok()
         .or_else(|| env::var("REDIS_URL").ok());
+    let reclaim_interval = env::var("SCPY_RECLAIM_INTERVAL_MILLIS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(1));
+    let reclaim_batch_limit = env::var("SCPY_RECLAIM_BATCH_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(128);
     let app_state = if let Some(redis_url) = redis_url {
         tracing::info!("starting with redis room store");
-        AppState::redis(&redis_url, room_ttl)
+        AppState::redis_with_reclaimer(&redis_url, room_ttl, reclaim_interval, reclaim_batch_limit)
             .await
             .expect("failed to connect to redis room store")
     } else {

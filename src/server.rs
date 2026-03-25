@@ -1,7 +1,7 @@
 use axum::{extract::FromRef, Router};
 use leptos::config::LeptosOptions;
 use leptos_axum::{generate_route_list, LeptosRoutes};
-use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+use tower_http::{compression::CompressionLayer, services::ServeFile, trace::TraceLayer};
 
 use crate::{
     api::{api_router, AppState},
@@ -32,12 +32,21 @@ pub fn build_router(leptos_options: LeptosOptions) -> Router {
 
 pub fn build_router_with_state(leptos_options: LeptosOptions, api_state: AppState) -> Router {
     let routes = generate_route_list(App);
+    let wasm_alias_path = format!(
+        "/{}/{}_bg.wasm",
+        leptos_options.site_pkg_dir, leptos_options.output_name
+    );
+    let wasm_asset_path = format!(
+        "{}/{}/{}.wasm",
+        leptos_options.site_root, leptos_options.site_pkg_dir, leptos_options.output_name
+    );
     let state = ServerState {
         api: api_state,
         leptos_options: leptos_options.clone(),
     };
 
     api_router::<ServerState>()
+        .route_service(&wasm_alias_path, ServeFile::new(wasm_asset_path))
         .leptos_routes(&state, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())

@@ -2,7 +2,6 @@ use std::{cell::RefCell, rc::Rc};
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos_meta::{provide_meta_context, Meta, MetaTags, Stylesheet, Title};
 use leptos_router::{
     components::{Route, Router, Routes},
     hooks::use_params_map,
@@ -46,7 +45,12 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options/>
-                <MetaTags/>
+                <link id="leptos" rel="stylesheet" href="/pkg/scpy-app.css"/>
+                <meta
+                    name="description"
+                    content="scpy.app is an end-to-end encrypted live clipboard with short links and live updates."
+                />
+                <title>"scpy.app | End-to-end encrypted live clipboard"</title>
             </head>
             <body class="app-body">
                 <App/>
@@ -57,38 +61,38 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
-    provide_meta_context();
+    AppBody()
+}
 
+#[component]
+pub fn AppBody() -> impl IntoView {
     view! {
-        <Stylesheet id="leptos" href="/pkg/scpy-app.css"/>
-        <Title text="scpy.app"/>
-        <Meta
-            name="description"
-            content="scpy.app is an end-to-end encrypted live clipboard with short links and live updates."
-        />
-
-        <Router>
-            <main class="page-shell">
+        <main class="page-shell">
+            <Router>
                 <Routes fallback=|| view! { <NotFoundPage/> }>
                     <Route path=StaticSegment("") view=LandingPage/>
-                    <Route path=(StaticSegment("r"), ParamSegment("room_id")) view=RoomPage/>
+                    <Route path=(StaticSegment("c"), ParamSegment("room_id")) view=RoomPage/>
                 </Routes>
-            </main>
-        </Router>
+            </Router>
+        </main>
     }
 }
 
 #[component]
 fn LandingPage() -> impl IntoView {
     let create_password = RwSignal::new(String::new());
-    let create_clipboard = RwSignal::new(String::from(
-        "Paste or type text here.\n\nCreate an encrypted clipboard, share the short link, and unlock it from another tab to see live updates.",
-    ));
+    let create_clipboard = RwSignal::new(String::new());
     let create_pending = RwSignal::new(false);
     let create_status = RwSignal::new(String::from(
         "Create an encrypted clipboard in the browser. Only encrypted metadata and ciphertext are sent to the backend.",
     ));
     let created_room_id = RwSignal::new(None::<String>);
+    let created_clipboard_href = move || {
+        created_room_id
+            .get()
+            .map(|room_id| room_href(&room_id))
+            .unwrap_or_default()
+    };
 
     let create_room = move |_| {
         let password = create_password.get();
@@ -135,7 +139,6 @@ fn LandingPage() -> impl IntoView {
 
     view! {
         <div class="landing-shell">
-            <Title text="scpy.app | End-to-end encrypted live clipboard"/>
             <header class="topbar">
                 <div class="brand-lockup">
                     <div class="brand-mark">"S"</div>
@@ -152,19 +155,24 @@ fn LandingPage() -> impl IntoView {
                         <p class="eyebrow">"Create"</p>
                         <h2 class="brand-name create-title">"Spin up an encrypted clipboard now."</h2>
                     </div>
-                    <div
-                        class=("status-pill", true)
-                        class=("status-pill-live", move || created_room_id.get().is_some())
-                    >
-                        {move || {
-                            if create_pending.get() {
-                                "creating"
-                            } else if created_room_id.get().is_some() {
-                                "ready"
-                            } else {
-                                "idle"
-                            }
-                        }}
+                    <div class=move || {
+                        if created_room_id.get().is_some() {
+                            "status-pill status-pill-live"
+                        } else {
+                            "status-pill"
+                        }
+                    }>
+                        <span>
+                            {move || {
+                                if create_pending.get() {
+                                    "creating"
+                                } else if created_room_id.get().is_some() {
+                                    "ready"
+                                } else {
+                                    "idle"
+                                }
+                            }}
+                        </span>
                     </div>
                 </div>
 
@@ -185,6 +193,7 @@ fn LandingPage() -> impl IntoView {
                         <textarea
                             class="text-area text-area-compact"
                             rows="8"
+                            placeholder="Paste or type text here."
                             prop:value=move || create_clipboard.get()
                             on:input=move |ev| create_clipboard.set(event_target_value(&ev))
                         ></textarea>
@@ -197,28 +206,34 @@ fn LandingPage() -> impl IntoView {
                         disabled=move || create_pending.get()
                         on:click=create_room
                     >
-                        {move || if create_pending.get() { "Creating clipboard…" } else { "Create encrypted clipboard" }}
+                        <span>
+                            {move || {
+                                if create_pending.get() {
+                                    "Creating clipboard…"
+                                } else {
+                                    "Create encrypted clipboard"
+                                }
+                            }}
+                        </span>
                     </button>
                 </div>
 
-                <p class="room-copy">{move || create_status.get()}</p>
+                <p class="room-copy">
+                    <span>{move || create_status.get()}</span>
+                </p>
 
-                {move || {
-                    created_room_id.get().map(|room_id| {
-                        let href = room_href(&room_id);
-                        view! {
-                            <div class="share-card">
-                                <p class="field-label">"Shareable link"</p>
-                                <div class="share-row">
-                                    <input class="text-input" readonly=true prop:value=href.clone()/>
-                                    <a class="button button-secondary" href=href.clone()>
-                                        "Open clipboard"
-                                    </a>
-                                </div>
-                            </div>
-                        }
-                    })
-                }}
+                <div
+                    class="share-card"
+                    class=("share-card-hidden", move || created_room_id.get().is_none())
+                >
+                    <p class="field-label">"Shareable link"</p>
+                    <div class="share-row">
+                        <input class="text-input" readonly=true prop:value=created_clipboard_href/>
+                        <a class="button button-secondary" href=created_clipboard_href>
+                            "Open clipboard"
+                        </a>
+                    </div>
+                </div>
             </section>
 
             <section class="hero-copy card">
@@ -368,14 +383,12 @@ fn RoomPage() -> impl IntoView {
 
     view! {
         <div class="room-shell">
-            <Title text="Private clipboard | scpy.app"/>
-            <Meta name="robots" content="noindex, nofollow"/>
             <header class="topbar room-topbar">
                 <div class="brand-lockup">
                     <div class="brand-mark">"S"</div>
                     <div>
                         <p class="brand-kicker">"Encrypted clipboard"</p>
-                        <h2 class="brand-name">{move || format!("Clipboard {}", room_id())}</h2>
+                        <h2 class="brand-name">"scpy.app"</h2>
                     </div>
                 </div>
 
@@ -389,26 +402,8 @@ fn RoomPage() -> impl IntoView {
                     <div class="panel-head">
                         <div>
                             <p class="eyebrow">"End-to-end encrypted clipboard"</p>
-                            <h1 class="room-title">{move || room_id()}</h1>
-                        </div>
-                        <div class=("status-pill", true) class=("status-pill-live", move || unlocked.get())>
-                            {move || {
-                                if saving.get() {
-                                    "saving"
-                                } else if loading.get() {
-                                    "unlocking"
-                                } else if unlocked.get() {
-                                    "live"
-                                } else {
-                                    "locked"
-                                }
-                            }}
                         </div>
                     </div>
-
-                    <p class="room-copy">
-                        "Unlocking fetches ciphertext only. Saving sends ciphertext only. SSE updates deliver ciphertext only. The password and plaintext stay in this browser."
-                    </p>
 
                     <div class="share-card room-share-card">
                         <p class="field-label">"Share link"</p>
@@ -476,30 +471,6 @@ fn RoomPage() -> impl IntoView {
                         </button>
                     </div>
                 </div>
-
-                <aside class="room-side">
-                    <section class="side-card card">
-                        <p class="eyebrow">"Current flow"</p>
-                        <ul class="side-list">
-                            <li>"Unlock from the saved encrypted snapshot"</li>
-                            <li>"Save encrypted updates"</li>
-                            <li>"Live changes stream over SSE"</li>
-                            <li>"The secret key stays in memory"</li>
-                            <li>"Clipboard TTL refreshes on update"</li>
-                        </ul>
-                    </section>
-
-                    <section class="side-card card">
-                        <p class="eyebrow">"v1 limits"</p>
-                        <ul class="side-list">
-                            <li>"Text only"</li>
-                            <li>"Soft cap: 256 KiB"</li>
-                            <li>"Hard cap: 512 KiB"</li>
-                            <li>"Last-writer-wins"</li>
-                            <li>"Server sees ciphertext only"</li>
-                        </ul>
-                    </section>
-                </aside>
             </section>
         </div>
     }
@@ -522,7 +493,7 @@ fn NotFoundPage() -> impl IntoView {
 }
 
 fn room_href(room_id: &str) -> String {
-    format!("/r/{room_id}")
+    format!("/c/{room_id}")
 }
 
 fn close_room_stream(stream_slot: &Rc<RefCell<Option<RoomEventStream>>>) {

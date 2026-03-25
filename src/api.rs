@@ -80,37 +80,61 @@ impl AppState {
     }
 
     pub async fn redis(redis_url: &str, room_ttl: Duration) -> Result<Self, StoreError> {
-        let store = RedisRoomStore::connect(redis_url).await?;
-        Ok(Self::new(Arc::new(store), room_ttl))
+        Self::redis_with_reclaimer(redis_url, room_ttl, Duration::from_secs(1), 128).await
+    }
+
+    pub async fn redis_with_reclaimer(
+        redis_url: &str,
+        room_ttl: Duration,
+        reclaim_interval: Duration,
+        reclaim_batch_limit: usize,
+    ) -> Result<Self, StoreError> {
+        let store = RedisRoomStore::connect_with_options(redis_url, true).await?;
+        let state = Self::new(Arc::new(store.clone()), room_ttl);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(reclaim_interval);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match store.reclaim_expired(reclaim_batch_limit).await {
+                    Ok(result) if result.reclaimed > 0 || result.cleaned > 0 => {
+                        tracing::debug!(
+                            reclaimed = result.reclaimed,
+                            cleaned = result.cleaned,
+                            scanned = result.scanned,
+                            "reclaimed expired clipboard allocations"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, "failed to reclaim expired clipboard allocations");
+                    }
+                }
+            }
+        });
+        Ok(state)
     }
 
     async fn create_room(&self, request: CreateRoomRequest) -> Result<GetRoomResponse, StoreError> {
-        loop {
-            let room_id = generate_room_id();
-            if self.inner.store.get(&room_id).await?.is_some() {
-                continue;
-            }
+        let stored = self
+            .inner
+            .store
+            .create(
+                StoredRoom {
+                    meta: request.meta,
+                    envelope: request.envelope,
+                },
+                self.inner.room_ttl,
+            )
+            .await?;
 
-            self.inner
-                .store
-                .set(
-                    &room_id,
-                    StoredRoom {
-                        meta: request.meta.clone(),
-                        envelope: request.envelope.clone(),
-                    },
-                    self.inner.room_ttl,
-                )
-                .await?;
+        let _ = self.sender_for(&stored.room_id).await;
 
-            let _ = self.sender_for(&room_id).await;
-
-            return Ok(GetRoomResponse {
-                room_id,
-                meta: request.meta,
-                envelope: request.envelope,
-            });
-        }
+        Ok(GetRoomResponse {
+            room_id: stored.room_id,
+            meta: stored.meta,
+            envelope: stored.envelope,
+        })
     }
 
     async fn get_room(&self, room_id: &str) -> Result<Option<GetRoomResponse>, StoreError> {
@@ -131,22 +155,15 @@ impl AppState {
         room_id: &str,
         envelope: CipherEnvelope,
     ) -> Result<Option<UpdateClipboardResponse>, StoreError> {
-        let existing_room = match self.inner.store.get(room_id).await? {
+        let updated = match self
+            .inner
+            .store
+            .update(room_id, envelope.clone(), self.inner.room_ttl)
+            .await?
+        {
             Some(room) => room,
             None => return Ok(None),
         };
-
-        self.inner
-            .store
-            .set(
-                room_id,
-                StoredRoom {
-                    meta: existing_room.meta,
-                    envelope: envelope.clone(),
-                },
-                self.inner.room_ttl,
-            )
-            .await?;
 
         let event = ClipboardEvent {
             room_id: room_id.to_string(),
@@ -157,7 +174,7 @@ impl AppState {
 
         Ok(Some(UpdateClipboardResponse {
             room_id: room_id.to_string(),
-            version: envelope.version,
+            version: updated.content_version,
         }))
     }
 
@@ -294,19 +311,11 @@ async fn room_events(
     ))
 }
 
-fn store_error_to_status(_: StoreError) -> StatusCode {
-    StatusCode::INTERNAL_SERVER_ERROR
-}
-
-fn generate_room_id() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-    const ROOM_ID_LEN: usize = 10;
-
-    let mut bytes = [0u8; ROOM_ID_LEN];
-    getrandom::fill(&mut bytes).expect("room id randomness must be available");
-
-    bytes
-        .iter()
-        .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
-        .collect()
+fn store_error_to_status(error: StoreError) -> StatusCode {
+    match error {
+        StoreError::AllocatorExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        StoreError::VersionConflict { .. } => StatusCode::CONFLICT,
+        StoreError::InvalidRoomId => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }

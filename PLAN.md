@@ -37,13 +37,16 @@ Public product name:
 
 Recommended route shape:
 
-- `https://scpy.app/r/8F3kPq2WZa`
+- `https://scpy.app/c/2A7`
 
 ID strategy:
 
-- 10 characters.
-- Base58 or Crockford Base32 alphabet.
-- Randomly generated, not user chosen.
+- Allocated, not user chosen.
+- Minimum length: 3 characters.
+- Maximum length: 6 characters.
+- Human-safe Base56 alphabet.
+- Tiers are exhausted in order: `3 -> 4 -> 5 -> 6`.
+- Concrete allocator spec lives in `docs/redis_allocator.md`.
 
 ## Rendering and SEO
 

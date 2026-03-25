@@ -5,6 +5,9 @@ pub mod protocol;
 pub mod api;
 
 #[cfg(feature = "ssr")]
+pub mod allocator;
+
+#[cfg(feature = "ssr")]
 pub mod server;
 
 #[cfg(feature = "ssr")]

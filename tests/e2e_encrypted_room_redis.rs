@@ -1,23 +1,20 @@
 #![cfg(feature = "ssr")]
 
-use std::{env, time::Duration};
+mod support;
 
-use futures_util::StreamExt;
-use reqwest::{Client, Response};
+use std::time::Duration;
+
 use scpy_crypto::{create_room, decrypt_clipboard, encrypt_clipboard, unlock_room_key, KdfParams};
 use secopy::api::{
     api_router, AppState, ClipboardEvent, CreateRoomRequest, CreateRoomResponse, GetRoomResponse,
     UpdateClipboardRequest, UpdateClipboardResponse,
 };
+use support::{RedisTestInstance, SseStream};
 
 #[tokio::test]
-#[ignore = "requires SCPY_REDIS_URL or REDIS_URL"]
 async fn encrypted_room_flow_roundtrips_over_redis_backed_store() {
-    let redis_url = env::var("SCPY_REDIS_URL")
-        .ok()
-        .or_else(|| env::var("REDIS_URL").ok())
-        .expect("set SCPY_REDIS_URL or REDIS_URL for the redis integration test");
-    let state = AppState::redis(&redis_url, Duration::from_secs(60))
+    let redis = RedisTestInstance::start().await;
+    let state = AppState::redis(&redis.redis_url(), Duration::from_secs(60))
         .await
         .expect("redis-backed app state must connect");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -33,7 +30,7 @@ async fn encrypted_room_flow_roundtrips_over_redis_backed_store() {
             .expect("test server must run");
     });
 
-    let client = Client::new();
+    let client = reqwest::Client::new();
     let password = "shared redis test password";
 
     let user_one = create_room(password, "alpha clipboard", KdfParams::testing())
@@ -117,60 +114,99 @@ async fn encrypted_room_flow_roundtrips_over_redis_backed_store() {
     server.abort();
 }
 
-struct SseStream {
-    stream: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
-    buffer: String,
-}
+#[tokio::test]
+async fn redis_background_reclaimer_returns_expired_codes_to_the_live_app() {
+    let redis = RedisTestInstance::start().await;
+    let state = AppState::redis_with_reclaimer(
+        &redis.redis_url(),
+        Duration::from_millis(30),
+        Duration::from_millis(10),
+        32,
+    )
+    .await
+    .expect("redis-backed app state must connect");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener must bind");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("address must resolve")
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, api_router::<AppState>().with_state(state))
+            .await
+            .expect("test server must run");
+    });
 
-impl SseStream {
-    fn new(response: Response) -> Self {
-        Self {
-            stream: response.bytes_stream().boxed(),
-            buffer: String::new(),
-        }
-    }
+    let client = reqwest::Client::new();
+    let first_room = create_room("password one", "alpha clipboard", KdfParams::testing())
+        .expect("first room should encrypt");
+    let first_response = client
+        .post(format!("{base_url}/api/rooms"))
+        .json(&CreateRoomRequest {
+            meta: first_room.meta,
+            envelope: first_room.envelope,
+        })
+        .send()
+        .await
+        .expect("create request must succeed");
+    assert_eq!(first_response.status(), reqwest::StatusCode::CREATED);
+    let CreateRoomResponse {
+        room_id: first_room_id,
+    } = first_response
+        .json()
+        .await
+        .expect("create response must deserialize");
 
-    async fn next_event(&mut self) -> Result<ClipboardEvent, String> {
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(event) = extract_event(&mut self.buffer)? {
-                return Ok(event);
-            }
-
-            let next_chunk = self
-                .stream
-                .next()
+            let response = client
+                .get(format!("{base_url}/api/rooms/{first_room_id}"))
+                .send()
                 .await
-                .ok_or_else(|| "sse stream closed before an event arrived".to_string())?
-                .map_err(|error| error.to_string())?;
-
-            self.buffer
-                .push_str(std::str::from_utf8(&next_chunk).map_err(|error| error.to_string())?);
-        }
-    }
-}
-
-fn extract_event(buffer: &mut String) -> Result<Option<ClipboardEvent>, String> {
-    let normalized = buffer.replace("\r\n", "\n");
-    if let Some(separator) = normalized.find("\n\n") {
-        let event_block = normalized[..separator].to_string();
-        *buffer = normalized[separator + 2..].to_string();
-
-        let mut data_lines = Vec::new();
-        for line in event_block.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                data_lines.push(data.trim_start());
+                .expect("room fetch must succeed");
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    })
+    .await
+    .expect("room should expire from the live app");
 
-        if data_lines.is_empty() {
-            return Ok(None);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if redis.expiring_members().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    })
+    .await
+    .expect("background reclaimer should drain the expiry index");
 
-        let payload = data_lines.join("\n");
-        let event =
-            serde_json::from_str::<ClipboardEvent>(&payload).map_err(|error| error.to_string())?;
-        Ok(Some(event))
-    } else {
-        Ok(None)
-    }
+    let second_room = create_room("password two", "beta clipboard", KdfParams::testing())
+        .expect("second room should encrypt");
+    let second_response = client
+        .post(format!("{base_url}/api/rooms"))
+        .json(&CreateRoomRequest {
+            meta: second_room.meta,
+            envelope: second_room.envelope,
+        })
+        .send()
+        .await
+        .expect("second create request must succeed");
+    assert_eq!(second_response.status(), reqwest::StatusCode::CREATED);
+    let CreateRoomResponse {
+        room_id: second_room_id,
+    } = second_response
+        .json()
+        .await
+        .expect("second create response must deserialize");
+
+    assert_eq!(second_room_id, first_room_id);
+
+    server.abort();
 }

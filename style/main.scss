@@ -410,6 +410,10 @@ textarea {
   background: var(--surface-strong);
 }
 
+.share-card-hidden {
+  display: none;
+}
+
 .share-row {
   grid-template-columns: minmax(0, 1fr) max-content;
   align-items: center;
@@ -436,7 +440,7 @@ textarea {
 }
 
 .room-grid {
-  grid-template-columns: 1.35fr 0.75fr;
+  grid-template-columns: 1fr;
   align-items: start;
 }
 
