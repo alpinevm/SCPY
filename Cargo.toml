@@ -21,6 +21,7 @@ console_error_panic_hook = { version = "0.1", optional = true }
 futures-core = { version = "0.3", optional = true }
 getrandom = { version = "0.3", optional = true }
 gloo-net = { version = "0.6", optional = true }
+js-sys = { version = "0.3", optional = true }
 leptos_axum = { version = "0.8", optional = true }
 redis = { version = "1", features = ["tokio-comp"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -31,16 +32,19 @@ tower-http = { version = "0.6", features = ["compression-full", "trace"], option
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 wasm-bindgen = { version = "0.2.106", optional = true }
-web-sys = { version = "0.3", features = ["Event", "EventSource", "MessageEvent"], optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["Clipboard", "Document", "Event", "EventSource", "Location", "MessageEvent", "Navigator", "Window"], optional = true }
 
 [features]
 hydrate = [
     "leptos/hydrate",
     "dep:console_error_panic_hook",
     "dep:gloo-net",
+    "dep:js-sys",
     "dep:serde",
     "dep:serde_json",
     "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
     "dep:web-sys",
 ]
 ssr = [

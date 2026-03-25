@@ -15,6 +15,10 @@
   --teal: #1f8d86;
   --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
   --font-body: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+  --page-background:
+    radial-gradient(circle at top left, rgba(31, 141, 134, 0.18), transparent 34%),
+    radial-gradient(circle at 84% 16%, rgba(219, 108, 47, 0.18), transparent 28%),
+    linear-gradient(180deg, #fffdf8 0%, #f8f1e7 48%, #efe3d1 100%);
 }
 
 * {
@@ -23,6 +27,10 @@
 
 html {
   color-scheme: light;
+  min-height: 100%;
+  background-color: #efe3d1;
+  background-image: var(--page-background);
+  background-attachment: fixed;
 }
 
 body {
@@ -30,16 +38,15 @@ body {
   min-height: 100vh;
   color: var(--ink-950);
   font-family: var(--font-body);
-  background:
-    radial-gradient(circle at top left, rgba(31, 141, 134, 0.18), transparent 34%),
-    radial-gradient(circle at 84% 16%, rgba(219, 108, 47, 0.18), transparent 28%),
-    linear-gradient(180deg, #fffdf8 0%, #f8f1e7 48%, #efe3d1 100%);
+  background-color: #efe3d1;
+  background-image: var(--page-background);
+  background-attachment: fixed;
 }
 
 body::before {
   position: fixed;
   inset: 0;
-  z-index: -1;
+  z-index: 0;
   pointer-events: none;
   content: "";
   background-image:
@@ -61,6 +68,8 @@ textarea {
 }
 
 .page-shell {
+  position: relative;
+  z-index: 1;
   width: min(1200px, calc(100% - 40px));
   margin: 0 auto;
   padding: 32px 0 56px;
@@ -83,19 +92,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 14px;
-}
-
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 48px;
-  height: 48px;
-  border-radius: 16px;
-  color: #fff7ec;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  background: linear-gradient(135deg, var(--copper), var(--ink-900));
-  box-shadow: var(--shadow-sm);
+  padding-left: 18px;
 }
 
 .brand-kicker,
@@ -121,6 +118,17 @@ textarea {
 
 .brand-name {
   font-size: 1.15rem;
+  font-weight: 400;
+}
+
+.brand-muted {
+  font-weight: 400;
+  color: rgba(17, 26, 35, 0.76);
+}
+
+.brand-emphasis {
+  font-weight: 700;
+  color: var(--ink-950);
 }
 
 .topbar-meta {
@@ -418,6 +426,39 @@ textarea {
   grid-template-columns: minmax(0, 1fr) max-content;
   align-items: center;
   margin-top: 12px;
+}
+
+.share-link-input {
+  cursor: copy;
+}
+
+.copy-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 48px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.76);
+  color: var(--ink-900);
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.copy-link-button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(17, 26, 35, 0.22);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.copy-link-button svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
 }
 
 .room-share-card {

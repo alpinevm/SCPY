@@ -1,11 +1,12 @@
 use std::{cell::RefCell, rc::Rc};
 
+use leptos::html::Input;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::{
     components::{Route, Router, Routes},
-    hooks::use_params_map,
-    ParamSegment, StaticSegment,
+    hooks::{use_navigate, use_params_map},
+    NavigateOptions, ParamSegment, StaticSegment,
 };
 use scpy_crypto::{
     cipher_suite_label, create_room as create_encrypted_room, decrypt_clipboard, encrypt_clipboard,
@@ -22,7 +23,11 @@ use crate::protocol::{
 #[cfg(target_arch = "wasm32")]
 use gloo_net::http::Request;
 #[cfg(target_arch = "wasm32")]
+use js_sys::{Function, Reflect};
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::JsFuture;
 #[cfg(target_arch = "wasm32")]
 use web_sys::{Event, EventSource, MessageEvent};
 
@@ -79,6 +84,20 @@ pub fn AppBody() -> impl IntoView {
 }
 
 #[component]
+fn BrandWord() -> impl IntoView {
+    view! {
+        <h2 class="brand-name">
+            <span class="brand-emphasis">"S"</span>
+            <span class="brand-muted">"ecure "</span>
+            <span class="brand-emphasis">"C"</span>
+            <span class="brand-muted">"o"</span>
+            <span class="brand-emphasis">"P"</span>
+            <span class="brand-emphasis">"Y"</span>
+        </h2>
+    }
+}
+
+#[component]
 fn LandingPage() -> impl IntoView {
     let create_password = RwSignal::new(String::new());
     let create_clipboard = RwSignal::new(String::new());
@@ -86,17 +105,12 @@ fn LandingPage() -> impl IntoView {
     let create_status = RwSignal::new(String::from(
         "Create an encrypted clipboard in the browser. Only encrypted metadata and ciphertext are sent to the backend.",
     ));
-    let created_room_id = RwSignal::new(None::<String>);
-    let created_clipboard_href = move || {
-        created_room_id
-            .get()
-            .map(|room_id| room_href(&room_id))
-            .unwrap_or_default()
-    };
+    let navigate = use_navigate();
 
     let create_room = move |_| {
         let password = create_password.get();
         let clipboard = create_clipboard.get();
+        let navigate = navigate.clone();
 
         if password.trim().is_empty() {
             create_status.set("Enter a password before creating a clipboard.".to_string());
@@ -105,7 +119,6 @@ fn LandingPage() -> impl IntoView {
 
         create_pending.set(true);
         create_status.set("Encrypting locally and uploading ciphertext…".to_string());
-        created_room_id.set(None);
 
         spawn_local(async move {
             let result =
@@ -122,11 +135,8 @@ fn LandingPage() -> impl IntoView {
 
             match result {
                 Ok(CreateRoomResponse { room_id }) => {
-                    create_status.set(
-                        "Clipboard created. Share the link separately from the password."
-                            .to_string(),
-                    );
-                    created_room_id.set(Some(room_id));
+                    create_status.set("Clipboard created. Opening it now…".to_string());
+                    navigate(&room_href(&room_id), NavigateOptions::default());
                 }
                 Err(error) => {
                     create_status.set(format!("Clipboard creation failed: {error}"));
@@ -141,11 +151,7 @@ fn LandingPage() -> impl IntoView {
         <div class="landing-shell">
             <header class="topbar">
                 <div class="brand-lockup">
-                    <div class="brand-mark">"S"</div>
-                    <div>
-                        <p class="brand-kicker">"Open-source encrypted clipboard"</p>
-                        <h2 class="brand-name">"scpy.app"</h2>
-                    </div>
+                    <BrandWord/>
                 </div>
             </header>
 
@@ -155,19 +161,11 @@ fn LandingPage() -> impl IntoView {
                         <p class="eyebrow">"Create"</p>
                         <h2 class="brand-name create-title">"Spin up an encrypted clipboard now."</h2>
                     </div>
-                    <div class=move || {
-                        if created_room_id.get().is_some() {
-                            "status-pill status-pill-live"
-                        } else {
-                            "status-pill"
-                        }
-                    }>
+                    <div class="status-pill">
                         <span>
                             {move || {
                                 if create_pending.get() {
                                     "creating"
-                                } else if created_room_id.get().is_some() {
-                                    "ready"
                                 } else {
                                     "idle"
                                 }
@@ -221,19 +219,6 @@ fn LandingPage() -> impl IntoView {
                 <p class="room-copy">
                     <span>{move || create_status.get()}</span>
                 </p>
-
-                <div
-                    class="share-card"
-                    class=("share-card-hidden", move || created_room_id.get().is_none())
-                >
-                    <p class="field-label">"Shareable link"</p>
-                    <div class="share-row">
-                        <input class="text-input" readonly=true prop:value=created_clipboard_href/>
-                        <a class="button button-secondary" href=created_clipboard_href>
-                            "Open clipboard"
-                        </a>
-                    </div>
-                </div>
             </section>
 
             <section class="hero-copy card">
@@ -276,6 +261,8 @@ fn RoomPage() -> impl IntoView {
     let status = RwSignal::new(String::from(
         "Unlock the clipboard to fetch the encrypted snapshot and begin live updates.",
     ));
+    let share_copied = RwSignal::new(false);
+    let share_input_ref = NodeRef::<Input>::new();
     let stream_slot: Rc<RefCell<Option<RoomEventStream>>> = Rc::new(RefCell::new(None));
 
     let unlock_room = move |_| {
@@ -379,17 +366,27 @@ fn RoomPage() -> impl IntoView {
         });
     };
 
-    let room_link = move || room_href(&room_id());
+    let room_link = move || absolute_room_href(&room_id());
+    let copy_room_link = move |_| {
+        let link = absolute_room_href(&room_id());
+        let share_input_ref = share_input_ref;
+
+        spawn_local(async move {
+            match copy_text_to_clipboard(&link, share_input_ref).await {
+                Ok(()) => share_copied.set(true),
+                Err(error) => {
+                    share_copied.set(false);
+                    status.set(format!("Could not copy the share link: {error}"));
+                }
+            }
+        });
+    };
 
     view! {
         <div class="room-shell">
             <header class="topbar room-topbar">
                 <div class="brand-lockup">
-                    <div class="brand-mark">"S"</div>
-                    <div>
-                        <p class="brand-kicker">"Encrypted clipboard"</p>
-                        <h2 class="brand-name">"scpy.app"</h2>
-                    </div>
+                    <BrandWord/>
                 </div>
 
                 <a class="button button-secondary" href="/">
@@ -399,17 +396,27 @@ fn RoomPage() -> impl IntoView {
 
             <section class="room-grid">
                 <div class="room-main card">
-                    <div class="panel-head">
-                        <div>
-                            <p class="eyebrow">"End-to-end encrypted clipboard"</p>
-                        </div>
-                    </div>
-
                     <div class="share-card room-share-card">
                         <p class="field-label">"Share link"</p>
                         <div class="share-row">
-                            <input class="text-input" readonly=true prop:value=room_link/>
-                            <div class="status-pill">{move || format!("version {}", version.get())}</div>
+                            <input
+                                class="text-input share-link-input"
+                                readonly=true
+                                node_ref=share_input_ref
+                                prop:value=room_link
+                                on:click=copy_room_link.clone()
+                            />
+                            <button
+                                class="copy-link-button"
+                                type="button"
+                                on:click=copy_room_link
+                            >
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                    <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+                                    <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
+                                </svg>
+                                <span>{move || if share_copied.get() { "Copied" } else { "Copy" }}</span>
+                            </button>
                         </div>
                     </div>
 
@@ -434,7 +441,7 @@ fn RoomPage() -> impl IntoView {
                                 if loading.get() {
                                     "Unlocking…"
                                 } else if unlocked.get() {
-                                    "Reload snapshot"
+                                    "Reload clipboard"
                                 } else {
                                     "Unlock clipboard"
                                 }
@@ -462,13 +469,6 @@ fn RoomPage() -> impl IntoView {
                         >
                             {move || if saving.get() { "Sending…" } else { "Encrypt and send" }}
                         </button>
-                        <button
-                            class="button button-ghost"
-                            disabled=move || loading.get()
-                            on:click=unlock_room
-                        >
-                            "Decrypt latest snapshot"
-                        </button>
                     </div>
                 </div>
             </section>
@@ -494,6 +494,62 @@ fn NotFoundPage() -> impl IntoView {
 
 fn room_href(room_id: &str) -> String {
     format!("/c/{room_id}")
+}
+
+fn absolute_room_href(room_id: &str) -> String {
+    let room_path = room_href(room_id);
+
+    #[cfg(target_arch = "wasm32")]
+    if let Some(window) = web_sys::window() {
+        if let Ok(origin) = window.location().origin() {
+            return format!("{origin}{room_path}");
+        }
+    }
+
+    room_path
+}
+
+async fn copy_text_to_clipboard(text: &str, input_ref: NodeRef<Input>) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(window) = web_sys::window() else {
+            return Err("window is unavailable".to_string());
+        };
+
+        if JsFuture::from(window.navigator().clipboard().write_text(text))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        let Some(document) = window.document() else {
+            return Err("document is unavailable".to_string());
+        };
+        let Some(input) = input_ref.get() else {
+            return Err("share link input is unavailable".to_string());
+        };
+
+        input.select();
+
+        let exec_command = Reflect::get(document.as_ref(), &JsValue::from_str("execCommand"))
+            .map_err(|error| js_error(&error))?;
+        let exec_command = exec_command
+            .dyn_into::<Function>()
+            .map_err(|error| js_error(&error))?;
+
+        return match exec_command.call1(document.as_ref(), &JsValue::from_str("copy")) {
+            Ok(result) if result.as_bool() == Some(true) => Ok(()),
+            Ok(_) => Err("the browser rejected the copy command".to_string()),
+            Err(error) => Err(js_error(&error)),
+        };
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (text, input_ref);
+        Err("clipboard copy requires browser hydration".to_string())
+    }
 }
 
 fn close_room_stream(stream_slot: &Rc<RefCell<Option<RoomEventStream>>>) {
