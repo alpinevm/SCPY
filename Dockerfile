@@ -23,6 +23,7 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/secopy /app/secopy
 COPY --from=builder /app/target/site /app/target/site
+COPY --from=builder /app/Cargo.toml /app/Cargo.toml
 
 ENV RUST_LOG=info
 EXPOSE 3000
