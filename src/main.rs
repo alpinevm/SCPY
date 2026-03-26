@@ -12,14 +12,15 @@ async fn main() {
 
     tracing_subscriber::fmt::init();
 
-    let conf = get_configuration(Some("Cargo.toml")).or_else(|error| {
-        tracing::warn!(
+    let conf = get_configuration(Some("Cargo.toml"))
+        .or_else(|error| {
+            tracing::warn!(
             ?error,
             "failed to load Cargo.toml-based Leptos configuration; falling back to env/defaults"
         );
-        get_configuration(None)
-    })
-    .expect("failed to load Leptos configuration");
+            get_configuration(None)
+        })
+        .expect("failed to load Leptos configuration");
     let mut leptos_options = conf.leptos_options;
     let addr = env::var("PORT")
         .ok()

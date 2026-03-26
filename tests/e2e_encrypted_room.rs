@@ -1,14 +1,15 @@
 #![cfg(feature = "ssr")]
 
+mod support;
+
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use reqwest::{Client, Response};
 use scpy_crypto::{create_room, decrypt_clipboard, encrypt_clipboard, unlock_room_key, KdfParams};
 use secopy::api::{
-    api_router, AppState, ClipboardEvent, CreateRoomRequest, CreateRoomResponse, GetRoomResponse,
-    UpdateClipboardRequest, UpdateClipboardResponse,
+    api_router, AppState, ClipboardEvent, GetRoomResponse, UpdateClipboardRequest,
+    UpdateClipboardResponse,
 };
+use support::{authenticate_clipboard, cookie_client, create_clipboard, SseStream};
 
 #[tokio::test]
 async fn encrypted_room_flow_roundtrips_between_two_users_over_sse() {
@@ -26,27 +27,16 @@ async fn encrypted_room_flow_roundtrips_between_two_users_over_sse() {
             .expect("test server must run");
     });
 
-    let client = Client::new();
+    let user_one_client = cookie_client();
+    let user_two_client = cookie_client();
     let password = "shared test password";
 
     let user_one = create_room(password, "alpha clipboard", KdfParams::testing())
         .expect("user one should encrypt the initial room");
-    let create_response = client
-        .post(format!("{base_url}/api/rooms"))
-        .json(&CreateRoomRequest {
-            meta: user_one.meta.clone(),
-            envelope: user_one.envelope.clone(),
-        })
-        .send()
-        .await
-        .expect("create room request must succeed");
-    assert_eq!(create_response.status(), reqwest::StatusCode::CREATED);
-    let CreateRoomResponse { room_id } = create_response
-        .json()
-        .await
-        .expect("create room response must deserialize");
+    let room_id = create_clipboard(&user_one_client, &base_url, password, &user_one).await;
 
-    let room_snapshot = client
+    authenticate_clipboard(&user_two_client, &base_url, &room_id, password).await;
+    let room_snapshot = user_two_client
         .get(format!("{base_url}/api/rooms/{room_id}"))
         .send()
         .await
@@ -68,7 +58,8 @@ async fn encrypted_room_flow_roundtrips_between_two_users_over_sse() {
         .expect("user two should decrypt the initial ciphertext");
     assert_eq!(user_two_plaintext, "alpha clipboard");
 
-    let events_response = client
+    authenticate_clipboard(&user_one_client, &base_url, &room_id, password).await;
+    let events_response = user_one_client
         .get(format!("{base_url}/api/rooms/{room_id}/events"))
         .send()
         .await
@@ -79,7 +70,7 @@ async fn encrypted_room_flow_roundtrips_between_two_users_over_sse() {
     let next_version = envelope.version + 1;
     let updated_envelope = encrypt_clipboard(&user_two_room_key, "beta clipboard", next_version)
         .expect("user two should re-encrypt the clipboard");
-    let update_response = client
+    let update_response = user_two_client
         .post(format!("{base_url}/api/rooms/{room_id}/clipboard"))
         .json(&UpdateClipboardRequest {
             envelope: updated_envelope,
@@ -108,62 +99,4 @@ async fn encrypted_room_flow_roundtrips_between_two_users_over_sse() {
     assert_eq!(user_one_plaintext, "beta clipboard");
 
     server.abort();
-}
-
-struct SseStream {
-    stream: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
-    buffer: String,
-}
-
-impl SseStream {
-    fn new(response: Response) -> Self {
-        Self {
-            stream: response.bytes_stream().boxed(),
-            buffer: String::new(),
-        }
-    }
-
-    async fn next_event(&mut self) -> Result<ClipboardEvent, String> {
-        loop {
-            if let Some(event) = extract_event(&mut self.buffer)? {
-                return Ok(event);
-            }
-
-            let next_chunk = self
-                .stream
-                .next()
-                .await
-                .ok_or_else(|| "sse stream closed before an event arrived".to_string())?
-                .map_err(|error| error.to_string())?;
-
-            self.buffer
-                .push_str(std::str::from_utf8(&next_chunk).map_err(|error| error.to_string())?);
-        }
-    }
-}
-
-fn extract_event(buffer: &mut String) -> Result<Option<ClipboardEvent>, String> {
-    let normalized = buffer.replace("\r\n", "\n");
-    if let Some(separator) = normalized.find("\n\n") {
-        let event_block = normalized[..separator].to_string();
-        *buffer = normalized[separator + 2..].to_string();
-
-        let mut data_lines = Vec::new();
-        for line in event_block.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                data_lines.push(data.trim_start());
-            }
-        }
-
-        if data_lines.is_empty() {
-            return Ok(None);
-        }
-
-        let payload = data_lines.join("\n");
-        let event =
-            serde_json::from_str::<ClipboardEvent>(&payload).map_err(|error| error.to_string())?;
-        Ok(Some(event))
-    } else {
-        Ok(None)
-    }
 }

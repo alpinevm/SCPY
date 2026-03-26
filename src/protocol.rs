@@ -1,10 +1,13 @@
 use scpy_crypto::{CipherEnvelope, RoomMeta};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::OpaqueRoomRegistration;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateRoomRequest {
     pub meta: RoomMeta,
     pub envelope: CipherEnvelope,
+    pub auth: OpaqueRoomRegistration,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

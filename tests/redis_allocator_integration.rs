@@ -4,18 +4,47 @@ mod support;
 
 use std::{collections::BTreeSet, time::Duration};
 
+use opaque_ke::{ClientRegistrationFinishParameters, ServerRegistration};
+use rand::rngs::OsRng;
 use scpy_crypto::{create_room, encrypt_clipboard, KdfParams};
 use secopy::{
     allocator::{decode_room_id, encode_local_id, tier_capacity, FreeOutcome, TieredAllocator},
+    auth::{new_server_setup, OpaqueClientRegistration, StoredOpaqueRegistration},
     store::{FreeRoomResult, RedisRoomStore, RoomStore, StoreError, StoredRoom},
 };
 use support::RedisTestInstance;
+
+fn test_registration(password: &str) -> StoredOpaqueRegistration {
+    let credential_id = b"redis-integration-auth".to_vec();
+    let server_setup = new_server_setup();
+    let mut rng = OsRng;
+    let registration_start =
+        OpaqueClientRegistration::start(&mut rng, password.as_bytes()).expect("must start");
+    let registration_response =
+        ServerRegistration::start(&server_setup, registration_start.message, &credential_id)
+            .expect("must build response");
+    let registration_finish = registration_start
+        .state
+        .finish(
+            &mut rng,
+            password.as_bytes(),
+            registration_response.message,
+            ClientRegistrationFinishParameters::default(),
+        )
+        .expect("must finish registration");
+
+    StoredOpaqueRegistration {
+        credential_id,
+        password_file: ServerRegistration::finish(registration_finish.message),
+    }
+}
 
 fn encrypted_room(plaintext: &str) -> (StoredRoom, scpy_crypto::CreatedRoom) {
     let created =
         create_room("redis allocator password", plaintext, KdfParams::testing()).expect("room");
     (
         StoredRoom {
+            auth: test_registration("redis allocator password"),
             meta: created.meta.clone(),
             envelope: created.envelope.clone(),
         },
@@ -1059,4 +1088,193 @@ async fn redis_store_update_during_outage_errors_without_mutating_record() {
         .expect("get must succeed")
         .expect("record must still exist");
     assert_eq!(persisted.content_version, record.content_version);
+}
+
+#[tokio::test]
+async fn redis_store_roundtrips_opaque_registration() {
+    let (_redis, store) = connected_store().await;
+    let (room, _) = encrypted_room("auth roundtrip");
+    let expected_auth = room.auth.clone();
+    let record = store
+        .create(room, Duration::from_secs(60))
+        .await
+        .expect("create must succeed");
+
+    let fetched = store
+        .get_registration(&record.room_id)
+        .await
+        .expect("registration get must succeed")
+        .expect("registration must exist");
+    assert_eq!(fetched, expected_auth);
+}
+
+#[tokio::test]
+async fn redis_store_persists_opaque_server_setup_across_restart() {
+    let (redis, store) = connected_store().await;
+    let first = store
+        .get_or_create_server_setup()
+        .await
+        .expect("server setup must resolve");
+    let first_payload =
+        serde_json::to_string(&first).expect("server setup must serialize deterministically");
+
+    redis.restart().await;
+
+    let store = RedisRoomStore::connect(&redis.redis_url())
+        .await
+        .expect("redis store must reconnect");
+    let second = store
+        .get_or_create_server_setup()
+        .await
+        .expect("server setup must resolve after restart");
+    let second_payload =
+        serde_json::to_string(&second).expect("server setup must serialize deterministically");
+
+    assert_eq!(first_payload, second_payload);
+}
+
+#[tokio::test]
+async fn redis_store_roundtrips_opaque_login_state() {
+    let (_redis, store) = connected_store().await;
+    let state = secopy::auth::StoredOpaqueLoginState {
+        room_id: "abc".to_string(),
+        state: {
+            let password_file = test_registration("password").password_file;
+            let mut rng = OsRng;
+            let server_setup = new_server_setup();
+            let login_start = opaque_ke::ClientLogin::<secopy::auth::ScpyOpaqueCipherSuite>::start(
+                &mut rng,
+                b"password",
+            )
+            .expect("client login must start");
+            opaque_ke::ServerLogin::start(
+                &mut rng,
+                &server_setup,
+                Some(password_file),
+                login_start.message,
+                b"opaque-login-state",
+                opaque_ke::ServerLoginParameters::default(),
+            )
+            .expect("server login must start")
+            .state
+        },
+    };
+
+    store
+        .put_login_state("session-1", state.clone(), Duration::from_secs(60))
+        .await
+        .expect("put login state must succeed");
+    let fetched = store
+        .take_login_state("session-1")
+        .await
+        .expect("take login state must succeed")
+        .expect("login state must exist");
+    assert_eq!(fetched, state);
+    assert!(store
+        .take_login_state("session-1")
+        .await
+        .expect("take login state must succeed")
+        .is_none());
+}
+
+#[tokio::test]
+async fn redis_store_persists_opaque_login_state_across_restart() {
+    let (redis, store) = connected_store().await;
+    let state = secopy::auth::StoredOpaqueLoginState {
+        room_id: "opaque-room".to_string(),
+        state: {
+            let password_file = test_registration("password").password_file;
+            let mut rng = OsRng;
+            let server_setup = new_server_setup();
+            let login_start = opaque_ke::ClientLogin::<secopy::auth::ScpyOpaqueCipherSuite>::start(
+                &mut rng,
+                b"password",
+            )
+            .expect("client login must start");
+            opaque_ke::ServerLogin::start(
+                &mut rng,
+                &server_setup,
+                Some(password_file),
+                login_start.message,
+                b"opaque-login-state",
+                opaque_ke::ServerLoginParameters::default(),
+            )
+            .expect("server login must start")
+            .state
+        },
+    };
+
+    store
+        .put_login_state("session-restart", state.clone(), Duration::from_secs(60))
+        .await
+        .expect("put login state must succeed");
+
+    redis.restart().await;
+
+    let store = RedisRoomStore::connect(&redis.redis_url())
+        .await
+        .expect("redis store must reconnect");
+    let fetched = store
+        .take_login_state("session-restart")
+        .await
+        .expect("take login state must succeed")
+        .expect("login state must survive restart");
+    assert_eq!(fetched, state);
+}
+
+#[tokio::test]
+async fn redis_store_roundtrips_opaque_session() {
+    let (_redis, store) = connected_store().await;
+    let session = secopy::auth::StoredOpaqueSession {
+        room_id: "clip".to_string(),
+        created_at_ms: 10,
+        expires_at_ms: 20,
+    };
+
+    store
+        .put_session("session-2", session.clone(), Duration::from_secs(60))
+        .await
+        .expect("put session must succeed");
+    let fetched = store
+        .get_session("session-2")
+        .await
+        .expect("get session must succeed")
+        .expect("session must exist");
+    assert_eq!(fetched, session);
+    store
+        .delete_session("session-2")
+        .await
+        .expect("delete session must succeed");
+    assert!(store
+        .get_session("session-2")
+        .await
+        .expect("get session must succeed")
+        .is_none());
+}
+
+#[tokio::test]
+async fn redis_store_persists_opaque_session_across_restart() {
+    let (redis, store) = connected_store().await;
+    let session = secopy::auth::StoredOpaqueSession {
+        room_id: "clip".to_string(),
+        created_at_ms: 10,
+        expires_at_ms: 20,
+    };
+
+    store
+        .put_session("session-restart", session.clone(), Duration::from_secs(60))
+        .await
+        .expect("put session must succeed");
+
+    redis.restart().await;
+
+    let store = RedisRoomStore::connect(&redis.redis_url())
+        .await
+        .expect("redis store must reconnect");
+    let fetched = store
+        .get_session("session-restart")
+        .await
+        .expect("get session must succeed")
+        .expect("session must survive restart");
+    assert_eq!(fetched, session);
 }

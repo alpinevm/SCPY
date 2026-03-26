@@ -6,10 +6,12 @@ use std::time::Duration;
 
 use scpy_crypto::{create_room, decrypt_clipboard, encrypt_clipboard, unlock_room_key, KdfParams};
 use secopy::api::{
-    api_router, AppState, ClipboardEvent, CreateRoomRequest, CreateRoomResponse, GetRoomResponse,
-    UpdateClipboardRequest, UpdateClipboardResponse,
+    api_router, AppState, ClipboardEvent, GetRoomResponse, UpdateClipboardRequest,
+    UpdateClipboardResponse,
 };
-use support::{RedisTestInstance, SseStream};
+use support::{
+    authenticate_clipboard, cookie_client, create_clipboard, RedisTestInstance, SseStream,
+};
 
 #[tokio::test]
 async fn encrypted_room_flow_roundtrips_over_redis_backed_store() {
@@ -30,27 +32,16 @@ async fn encrypted_room_flow_roundtrips_over_redis_backed_store() {
             .expect("test server must run");
     });
 
-    let client = reqwest::Client::new();
+    let user_one_client = cookie_client();
+    let user_two_client = cookie_client();
     let password = "shared redis test password";
 
     let user_one = create_room(password, "alpha clipboard", KdfParams::testing())
         .expect("user one should encrypt the initial room");
-    let create_response = client
-        .post(format!("{base_url}/api/rooms"))
-        .json(&CreateRoomRequest {
-            meta: user_one.meta.clone(),
-            envelope: user_one.envelope.clone(),
-        })
-        .send()
-        .await
-        .expect("create room request must succeed");
-    assert_eq!(create_response.status(), reqwest::StatusCode::CREATED);
-    let CreateRoomResponse { room_id } = create_response
-        .json()
-        .await
-        .expect("create room response must deserialize");
+    let room_id = create_clipboard(&user_one_client, &base_url, password, &user_one).await;
 
-    let room_snapshot = client
+    authenticate_clipboard(&user_two_client, &base_url, &room_id, password).await;
+    let room_snapshot = user_two_client
         .get(format!("{base_url}/api/rooms/{room_id}"))
         .send()
         .await
@@ -72,7 +63,8 @@ async fn encrypted_room_flow_roundtrips_over_redis_backed_store() {
         .expect("user two should decrypt the initial ciphertext");
     assert_eq!(user_two_plaintext, "alpha clipboard");
 
-    let events_response = client
+    authenticate_clipboard(&user_one_client, &base_url, &room_id, password).await;
+    let events_response = user_one_client
         .get(format!("{base_url}/api/rooms/{room_id}/events"))
         .send()
         .await
@@ -83,7 +75,7 @@ async fn encrypted_room_flow_roundtrips_over_redis_backed_store() {
     let next_version = envelope.version + 1;
     let updated_envelope = encrypt_clipboard(&user_two_room_key, "beta clipboard", next_version)
         .expect("user two should re-encrypt the clipboard");
-    let update_response = client
+    let update_response = user_two_client
         .post(format!("{base_url}/api/rooms/{room_id}/clipboard"))
         .json(&UpdateClipboardRequest {
             envelope: updated_envelope,
@@ -138,25 +130,11 @@ async fn redis_background_reclaimer_returns_expired_codes_to_the_live_app() {
             .expect("test server must run");
     });
 
-    let client = reqwest::Client::new();
+    let client = cookie_client();
     let first_room = create_room("password one", "alpha clipboard", KdfParams::testing())
         .expect("first room should encrypt");
-    let first_response = client
-        .post(format!("{base_url}/api/rooms"))
-        .json(&CreateRoomRequest {
-            meta: first_room.meta,
-            envelope: first_room.envelope,
-        })
-        .send()
-        .await
-        .expect("create request must succeed");
-    assert_eq!(first_response.status(), reqwest::StatusCode::CREATED);
-    let CreateRoomResponse {
-        room_id: first_room_id,
-    } = first_response
-        .json()
-        .await
-        .expect("create response must deserialize");
+    let first_room_id = create_clipboard(&client, &base_url, "password one", &first_room).await;
+    authenticate_clipboard(&client, &base_url, &first_room_id, "password one").await;
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -189,22 +167,7 @@ async fn redis_background_reclaimer_returns_expired_codes_to_the_live_app() {
 
     let second_room = create_room("password two", "beta clipboard", KdfParams::testing())
         .expect("second room should encrypt");
-    let second_response = client
-        .post(format!("{base_url}/api/rooms"))
-        .json(&CreateRoomRequest {
-            meta: second_room.meta,
-            envelope: second_room.envelope,
-        })
-        .send()
-        .await
-        .expect("second create request must succeed");
-    assert_eq!(second_response.status(), reqwest::StatusCode::CREATED);
-    let CreateRoomResponse {
-        room_id: second_room_id,
-    } = second_response
-        .json()
-        .await
-        .expect("second create response must deserialize");
+    let second_room_id = create_clipboard(&client, &base_url, "password two", &second_room).await;
 
     assert_eq!(second_room_id, first_room_id);
 

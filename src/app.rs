@@ -8,11 +8,18 @@ use leptos_router::{
     hooks::{use_navigate, use_params_map},
     NavigateOptions, ParamSegment, StaticSegment,
 };
+use opaque_ke::{ClientLoginFinishParameters, ClientRegistrationFinishParameters};
+use rand::rngs::OsRng;
 use scpy_crypto::{
     cipher_suite_label, create_room as create_encrypted_room, decrypt_clipboard, encrypt_clipboard,
     unlock_room_key, KdfParams, RoomKey,
 };
 
+use crate::auth::{
+    OpaqueClientLogin, OpaqueClientRegistration, OpaqueLoginFinishRequest,
+    OpaqueLoginFinishResponse, OpaqueLoginStartRequest, OpaqueLoginStartResponse,
+    OpaqueRegistrationStartRequest, OpaqueRegistrationStartResponse, OpaqueRoomRegistration,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::protocol::ClipboardEvent;
 use crate::protocol::{
@@ -118,13 +125,59 @@ fn LandingPage() -> impl IntoView {
         }
 
         create_pending.set(true);
-        create_status.set("Encrypting locally and uploading ciphertext…".to_string());
+        create_status.set(
+            "Encrypting locally, registering password auth, and uploading ciphertext…".to_string(),
+        );
 
         spawn_local(async move {
             let result =
                 match create_encrypted_room(&password, &clipboard, KdfParams::interactive()) {
                     Ok(created) => {
+                        let mut client_rng = OsRng;
+                        let registration_start = match OpaqueClientRegistration::start(
+                            &mut client_rng,
+                            password.as_bytes(),
+                        ) {
+                            Ok(registration_start) => registration_start,
+                            Err(error) => {
+                                create_pending.set(false);
+                                create_status.set(format!("Clipboard creation failed: {error}"));
+                                return;
+                            }
+                        };
+                        let registration_response =
+                            match register_start_remote(&OpaqueRegistrationStartRequest {
+                                message: registration_start.message.clone(),
+                            })
+                            .await
+                            {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    create_pending.set(false);
+                                    create_status
+                                        .set(format!("Clipboard creation failed: {error}"));
+                                    return;
+                                }
+                            };
+                        let registration_finish = match registration_start.state.finish(
+                            &mut client_rng,
+                            password.as_bytes(),
+                            registration_response.message,
+                            ClientRegistrationFinishParameters::default(),
+                        ) {
+                            Ok(registration_finish) => registration_finish,
+                            Err(error) => {
+                                create_pending.set(false);
+                                create_status.set(format!("Clipboard creation failed: {error}"));
+                                return;
+                            }
+                        };
+
                         create_remote_room(&CreateRoomRequest {
+                            auth: OpaqueRoomRegistration {
+                                credential_id: registration_response.credential_id,
+                                registration_upload: registration_finish.message,
+                            },
                             meta: created.meta,
                             envelope: created.envelope,
                         })
@@ -279,9 +332,70 @@ fn RoomPage() -> impl IntoView {
         }
 
         loading.set(true);
-        status.set("Fetching ciphertext and decrypting locally…".to_string());
+        status.set("Authenticating locally and requesting ciphertext…".to_string());
 
         spawn_local(async move {
+            let mut client_rng = OsRng;
+            let login_start =
+                match OpaqueClientLogin::start(&mut client_rng, password_value.as_bytes()) {
+                    Ok(login_start) => login_start,
+                    Err(error) => {
+                        close_room_stream(&stream_slot);
+                        room_key.set(None);
+                        unlocked.set(false);
+                        status.set(format!("Unlock failed: {error}"));
+                        loading.set(false);
+                        return;
+                    }
+                };
+            let login_response = match login_start_remote(&OpaqueLoginStartRequest {
+                room_id: room_id_value.clone(),
+                message: login_start.message.clone(),
+            })
+            .await
+            {
+                Ok(login_response) => login_response,
+                Err(error) => {
+                    close_room_stream(&stream_slot);
+                    room_key.set(None);
+                    unlocked.set(false);
+                    status.set(format!("Unlock failed: {error}"));
+                    loading.set(false);
+                    return;
+                }
+            };
+            let login_finish = match login_start.state.finish(
+                &mut client_rng,
+                password_value.as_bytes(),
+                login_response.message,
+                ClientLoginFinishParameters::default(),
+            ) {
+                Ok(login_finish) => login_finish,
+                Err(_) => {
+                    close_room_stream(&stream_slot);
+                    room_key.set(None);
+                    unlocked.set(false);
+                    status.set(
+                        "Unlock failed: incorrect password or clipboard unavailable.".to_string(),
+                    );
+                    loading.set(false);
+                    return;
+                }
+            };
+            if let Err(error) = finish_login_remote(&OpaqueLoginFinishRequest {
+                login_session_id: login_response.login_session_id,
+                message: login_finish.message,
+            })
+            .await
+            {
+                close_room_stream(&stream_slot);
+                room_key.set(None);
+                unlocked.set(false);
+                status.set(format!("Unlock failed: {error}"));
+                loading.set(false);
+                return;
+            }
+
             let result = fetch_room_snapshot(&room_id_value)
                 .await
                 .and_then(|snapshot| {
@@ -671,6 +785,102 @@ async fn create_remote_room(request: &CreateRoomRequest) -> Result<CreateRoomRes
 #[cfg(not(target_arch = "wasm32"))]
 async fn create_remote_room(_request: &CreateRoomRequest) -> Result<CreateRoomResponse, String> {
     Err("Clipboard creation requires browser hydration.".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn register_start_remote(
+    request: &OpaqueRegistrationStartRequest,
+) -> Result<OpaqueRegistrationStartResponse, String> {
+    let response = Request::post("/api/auth/register/start")
+        .json(request)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.ok() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "server returned {status} while starting password registration: {body}"
+        ));
+    }
+
+    response
+        .json::<OpaqueRegistrationStartResponse>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn register_start_remote(
+    _request: &OpaqueRegistrationStartRequest,
+) -> Result<OpaqueRegistrationStartResponse, String> {
+    Err("Password registration requires browser hydration.".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn login_start_remote(
+    request: &OpaqueLoginStartRequest,
+) -> Result<OpaqueLoginStartResponse, String> {
+    let response = Request::post("/api/auth/login/start")
+        .json(request)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.ok() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "server returned {status} while starting password login: {body}"
+        ));
+    }
+
+    response
+        .json::<OpaqueLoginStartResponse>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn login_start_remote(
+    _request: &OpaqueLoginStartRequest,
+) -> Result<OpaqueLoginStartResponse, String> {
+    Err("Password login requires browser hydration.".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn finish_login_remote(
+    request: &OpaqueLoginFinishRequest,
+) -> Result<OpaqueLoginFinishResponse, String> {
+    let response = Request::post("/api/auth/login/finish")
+        .json(request)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.ok() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "server returned {status} while finishing password login: {body}"
+        ));
+    }
+
+    response
+        .json::<OpaqueLoginFinishResponse>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn finish_login_remote(
+    _request: &OpaqueLoginFinishRequest,
+) -> Result<OpaqueLoginFinishResponse, String> {
+    Err("Password login requires browser hydration.".to_string())
 }
 
 #[cfg(target_arch = "wasm32")]

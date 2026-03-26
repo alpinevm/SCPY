@@ -1,10 +1,127 @@
 #![allow(dead_code)]
 
-use std::{process::Command, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    process::Command,
+    time::Duration,
+};
 
 use futures_util::StreamExt;
+use leptos::{config::LeptosOptions, prelude::get_configuration};
+use opaque_ke::{ClientLoginFinishParameters, ClientRegistrationFinishParameters};
+use rand::rngs::OsRng;
 use redis::aio::MultiplexedConnection;
-use reqwest::Response;
+use reqwest::{Client, Response, StatusCode};
+use scpy_crypto::CreatedRoom;
+use secopy::{
+    api::{api_router, AppState},
+    auth::{
+        OpaqueClientLogin, OpaqueClientLoginStart, OpaqueClientRegistration,
+        OpaqueLoginFinishRequest, OpaqueLoginStartRequest, OpaqueLoginStartResponse,
+        OpaqueRegistrationStartRequest,
+    },
+    protocol::{CreateRoomRequest, CreateRoomResponse},
+    server::build_router_with_state,
+};
+use tokio::task::JoinHandle;
+
+pub struct TestServer {
+    pub addr: SocketAddr,
+    pub base_url: String,
+    handle: JoinHandle<()>,
+}
+
+impl TestServer {
+    pub fn abort(self) {
+        self.handle.abort();
+    }
+}
+
+pub async fn spawn_api_test_server(state: AppState) -> TestServer {
+    spawn_api_test_server_at(
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        state,
+    )
+    .await
+}
+
+pub async fn spawn_api_test_server_at(addr: SocketAddr, state: AppState) -> TestServer {
+    let listener = bind_listener(addr).await;
+    let addr = listener.local_addr().expect("address must resolve");
+    let base_url = format!("http://{addr}");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, api_router::<AppState>().with_state(state))
+            .await
+            .expect("test server must run");
+    });
+    TestServer {
+        addr,
+        base_url,
+        handle,
+    }
+}
+
+pub async fn spawn_full_app_test_server(state: AppState) -> TestServer {
+    spawn_full_app_test_server_at(
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        state,
+    )
+    .await
+}
+
+pub async fn spawn_full_app_test_server_at(addr: SocketAddr, state: AppState) -> TestServer {
+    spawn_full_app_test_server_at_with_options(addr, leptos_options_for_addr(addr), state).await
+}
+
+pub async fn spawn_full_app_test_server_at_with_options(
+    addr: SocketAddr,
+    leptos_options: LeptosOptions,
+    state: AppState,
+) -> TestServer {
+    let listener = bind_listener(addr).await;
+    let addr = listener.local_addr().expect("address must resolve");
+    let base_url = format!("http://{addr}");
+    let app = build_router_with_state(leptos_options, state);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .expect("test server must run");
+    });
+    TestServer {
+        addr,
+        base_url,
+        handle,
+    }
+}
+
+pub fn leptos_options_for_addr(addr: SocketAddr) -> LeptosOptions {
+    let configuration = get_configuration(Some("Cargo.toml"))
+        .or_else(|_| get_configuration(None))
+        .expect("leptos configuration must load");
+    let mut leptos_options = configuration.leptos_options;
+    leptos_options.site_addr = addr;
+    leptos_options
+}
+
+async fn bind_listener(addr: SocketAddr) -> tokio::net::TcpListener {
+    let mut last_error = None;
+    for _ in 0..40 {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return listener,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    panic!(
+        "listener must bind: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown bind error".to_string())
+    );
+}
 
 pub struct RedisTestInstance {
     container_id: String,
@@ -215,6 +332,157 @@ impl Drop for RedisTestInstance {
 pub struct SseStream {
     stream: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
     buffer: String,
+}
+
+pub fn cookie_client() -> Client {
+    Client::builder()
+        .cookie_store(true)
+        .build()
+        .expect("cookie client must build")
+}
+
+pub async fn create_clipboard(
+    client: &Client,
+    base_url: &str,
+    password: &str,
+    created: &CreatedRoom,
+) -> String {
+    let mut rng = OsRng;
+    let registration_start =
+        OpaqueClientRegistration::start(&mut rng, password.as_bytes()).expect("must start");
+    let registration_response = client
+        .post(format!("{base_url}/api/auth/register/start"))
+        .json(&OpaqueRegistrationStartRequest {
+            message: registration_start.message.clone(),
+        })
+        .send()
+        .await
+        .expect("registration start must succeed");
+    assert_eq!(registration_response.status(), StatusCode::OK);
+    let registration_response = registration_response
+        .json::<secopy::auth::OpaqueRegistrationStartResponse>()
+        .await
+        .expect("registration response must deserialize");
+    let registration_finish = registration_start
+        .state
+        .finish(
+            &mut rng,
+            password.as_bytes(),
+            registration_response.message,
+            ClientRegistrationFinishParameters::default(),
+        )
+        .expect("registration must finish");
+
+    let create_response = client
+        .post(format!("{base_url}/api/rooms"))
+        .json(&CreateRoomRequest {
+            auth: secopy::auth::OpaqueRoomRegistration {
+                credential_id: registration_response.credential_id,
+                registration_upload: registration_finish.message,
+            },
+            meta: created.meta.clone(),
+            envelope: created.envelope.clone(),
+        })
+        .send()
+        .await
+        .expect("create room request must succeed");
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    create_response
+        .json::<CreateRoomResponse>()
+        .await
+        .expect("create room response must deserialize")
+        .room_id
+}
+
+pub async fn authenticate_clipboard(
+    client: &Client,
+    base_url: &str,
+    room_id: &str,
+    password: &str,
+) {
+    let (login_start, login_start_response) =
+        start_authenticate_clipboard(client, base_url, room_id, password).await;
+    let login_finish_response = finish_authenticate_clipboard(
+        client,
+        base_url,
+        password,
+        login_start,
+        login_start_response,
+    )
+    .await;
+    assert_eq!(login_finish_response.status(), StatusCode::OK);
+}
+
+pub async fn start_authenticate_clipboard(
+    client: &Client,
+    base_url: &str,
+    room_id: &str,
+    password: &str,
+) -> (OpaqueClientLoginStart, OpaqueLoginStartResponse) {
+    let mut rng = OsRng;
+    let login_start =
+        OpaqueClientLogin::start(&mut rng, password.as_bytes()).expect("login must start");
+    let login_start_response = client
+        .post(format!("{base_url}/api/auth/login/start"))
+        .json(&OpaqueLoginStartRequest {
+            room_id: room_id.to_string(),
+            message: login_start.message.clone(),
+        })
+        .send()
+        .await
+        .expect("login start must succeed");
+    if login_start_response.status() != StatusCode::OK {
+        let status = login_start_response.status();
+        let body = login_start_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        panic!("login start failed: status={status}, body={body}");
+    }
+    (
+        login_start,
+        login_start_response
+            .json::<secopy::auth::OpaqueLoginStartResponse>()
+            .await
+            .expect("login start response must deserialize"),
+    )
+}
+
+pub async fn finish_authenticate_clipboard(
+    client: &Client,
+    base_url: &str,
+    password: &str,
+    login_start: OpaqueClientLoginStart,
+    login_start_response: OpaqueLoginStartResponse,
+) -> Response {
+    let request = login_finish_request(password, login_start, login_start_response);
+    client
+        .post(format!("{base_url}/api/auth/login/finish"))
+        .json(&request)
+        .send()
+        .await
+        .expect("login finish must succeed")
+}
+
+pub fn login_finish_request(
+    password: &str,
+    login_start: OpaqueClientLoginStart,
+    login_start_response: OpaqueLoginStartResponse,
+) -> OpaqueLoginFinishRequest {
+    let mut rng = OsRng;
+    let login_finish = login_start
+        .state
+        .finish(
+            &mut rng,
+            password.as_bytes(),
+            login_start_response.message,
+            ClientLoginFinishParameters::default(),
+        )
+        .expect("login must finish");
+    OpaqueLoginFinishRequest {
+        login_session_id: login_start_response.login_session_id,
+        message: login_finish.message,
+    }
 }
 
 impl SseStream {

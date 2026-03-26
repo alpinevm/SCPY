@@ -5,18 +5,23 @@ use std::{
 };
 
 use async_trait::async_trait;
-use redis::{aio::MultiplexedConnection, Script};
+use redis::{aio::MultiplexedConnection, AsyncConnectionConfig, Script};
 use scpy_crypto::{CipherEnvelope, RoomMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::allocator::{decode_room_id, encode_local_id, TieredAllocator};
+use crate::auth::{
+    new_server_setup, OpaqueServerSetup, StoredOpaqueLoginState, StoredOpaqueRegistration,
+    StoredOpaqueSession,
+};
 
 const STORE_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StoredRoom {
+    pub auth: StoredOpaqueRegistration,
     pub meta: RoomMeta,
     pub envelope: CipherEnvelope,
 }
@@ -31,6 +36,7 @@ pub struct StoredRoomRecord {
     pub updated_at_ms: u64,
     pub expires_at_ms: u64,
     pub content_version: u64,
+    pub auth: StoredOpaqueRegistration,
     pub meta: RoomMeta,
     pub envelope: CipherEnvelope,
 }
@@ -50,6 +56,7 @@ impl StoredRoomRecord {
             updated_at_ms: now_ms,
             expires_at_ms,
             content_version,
+            auth: room.auth,
             meta: room.meta,
             envelope: room.envelope,
         }
@@ -81,6 +88,8 @@ pub enum StoreError {
     InvalidRoomId,
     #[error("version conflict: current={current}, attempted={attempted}")]
     VersionConflict { current: u64, attempted: u64 },
+    #[error("opaque protocol failed: {0}")]
+    Opaque(String),
     #[error("script protocol error: {0}")]
     ScriptProtocol(&'static str),
 }
@@ -90,17 +99,44 @@ pub trait RoomStore: Send + Sync {
     async fn create(&self, room: StoredRoom, ttl: Duration)
         -> Result<StoredRoomRecord, StoreError>;
     async fn get(&self, room_id: &str) -> Result<Option<StoredRoomRecord>, StoreError>;
+    async fn get_registration(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<StoredOpaqueRegistration>, StoreError>;
     async fn update(
         &self,
         room_id: &str,
         envelope: CipherEnvelope,
         ttl: Duration,
     ) -> Result<Option<StoredRoomRecord>, StoreError>;
+    async fn put_login_state(
+        &self,
+        login_session_id: &str,
+        state: StoredOpaqueLoginState,
+        ttl: Duration,
+    ) -> Result<(), StoreError>;
+    async fn take_login_state(
+        &self,
+        login_session_id: &str,
+    ) -> Result<Option<StoredOpaqueLoginState>, StoreError>;
+    async fn put_session(
+        &self,
+        session_id: &str,
+        session: StoredOpaqueSession,
+        ttl: Duration,
+    ) -> Result<(), StoreError>;
+    async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredOpaqueSession>, StoreError>;
+    async fn delete_session(&self, session_id: &str) -> Result<(), StoreError>;
 }
 
 #[derive(Clone, Default)]
 pub struct MemoryRoomStore {
     rooms: Arc<RwLock<HashMap<String, ExpiringRoom>>>,
+    login_states: Arc<RwLock<HashMap<String, ExpiringValue<StoredOpaqueLoginState>>>>,
+    sessions: Arc<RwLock<HashMap<String, ExpiringValue<StoredOpaqueSession>>>>,
     allocator: Arc<Mutex<TieredAllocator>>,
 }
 
@@ -114,6 +150,12 @@ pub struct RedisRoomStore {
 #[derive(Clone, Debug)]
 struct ExpiringRoom {
     record: StoredRoomRecord,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ExpiringValue<T> {
+    value: T,
     expires_at: Instant,
 }
 
@@ -159,6 +201,7 @@ struct ReclaimScriptResponse {
 #[derive(Serialize)]
 struct CreateScriptPayload<'a> {
     schema_version: u8,
+    auth: &'a StoredOpaqueRegistration,
     meta: &'a RoomMeta,
     envelope: &'a CipherEnvelope,
 }
@@ -167,6 +210,8 @@ impl MemoryRoomStore {
     pub fn new() -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            login_states: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             allocator: Arc::new(Mutex::new(TieredAllocator::new())),
         }
     }
@@ -184,6 +229,24 @@ impl MemoryRoomStore {
         let _ = allocator.free(expired.code_len, expired.local_id);
         Some(expired)
     }
+
+    async fn get_expiring_value<T: Clone>(
+        values: &RwLock<HashMap<String, ExpiringValue<T>>>,
+        key: &str,
+        now: Instant,
+    ) -> Option<T> {
+        {
+            let values = values.read().await;
+            match values.get(key) {
+                Some(entry) if entry.expires_at > now => return Some(entry.value.clone()),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+
+        values.write().await.remove(key);
+        None
+    }
 }
 
 impl RedisRoomStore {
@@ -196,7 +259,12 @@ impl RedisRoomStore {
         use_expiry_index: bool,
     ) -> Result<Self, StoreError> {
         let client = redis::Client::open(redis_url)?;
-        let mut connection = client.get_multiplexed_async_connection().await?;
+        let connection_config = AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(Duration::from_secs(5)))
+            .set_response_timeout(Some(Duration::from_secs(10)));
+        let mut connection = client
+            .get_multiplexed_async_connection_with_config(&connection_config)
+            .await?;
         let store = Self {
             connection: connection.clone(),
             key_prefix: "scpy".to_string(),
@@ -274,6 +342,40 @@ impl RedisRoomStore {
             cleaned: response.cleaned.unwrap_or_default(),
             scanned: response.scanned.unwrap_or_default(),
         })
+    }
+
+    pub async fn get_or_create_server_setup(&self) -> Result<OpaqueServerSetup, StoreError> {
+        let mut connection = self.connection.clone();
+        let key = format!("{}:opaque:setup", self.key_prefix);
+
+        if let Some(payload) = redis::cmd("GET")
+            .arg(&key)
+            .query_async::<Option<String>>(&mut connection)
+            .await?
+        {
+            return serde_json::from_str::<OpaqueServerSetup>(&payload).map_err(StoreError::from);
+        }
+
+        let setup = new_server_setup();
+        let payload = serde_json::to_string(&setup)?;
+        let inserted = redis::cmd("SETNX")
+            .arg(&key)
+            .arg(&payload)
+            .query_async::<bool>(&mut connection)
+            .await?;
+
+        if inserted {
+            return Ok(setup);
+        }
+
+        let payload = redis::cmd("GET")
+            .arg(&key)
+            .query_async::<Option<String>>(&mut connection)
+            .await?
+            .ok_or(StoreError::ScriptProtocol(
+                "opaque setup missing after failed setnx",
+            ))?;
+        serde_json::from_str::<OpaqueServerSetup>(&payload).map_err(StoreError::from)
     }
 
     pub async fn free_intervals(&self, code_len: u8) -> Result<Vec<(u64, u64)>, StoreError> {
@@ -376,6 +478,13 @@ impl RoomStore for MemoryRoomStore {
         Ok(None)
     }
 
+    async fn get_registration(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<StoredOpaqueRegistration>, StoreError> {
+        Ok(self.get(room_id).await?.map(|record| record.auth))
+    }
+
     async fn update(
         &self,
         room_id: &str,
@@ -417,6 +526,65 @@ impl RoomStore for MemoryRoomStore {
 
         Ok(Some(entry.record.clone()))
     }
+
+    async fn put_login_state(
+        &self,
+        login_session_id: &str,
+        state: StoredOpaqueLoginState,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        let expires_at = Instant::now().checked_add(ttl).unwrap_or_else(Instant::now);
+        self.login_states.write().await.insert(
+            login_session_id.to_string(),
+            ExpiringValue {
+                value: state,
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
+    async fn take_login_state(
+        &self,
+        login_session_id: &str,
+    ) -> Result<Option<StoredOpaqueLoginState>, StoreError> {
+        let now = Instant::now();
+        let mut states = self.login_states.write().await;
+        match states.remove(login_session_id) {
+            Some(entry) if entry.expires_at > now => Ok(Some(entry.value)),
+            Some(_) => Ok(None),
+            None => Ok(None),
+        }
+    }
+
+    async fn put_session(
+        &self,
+        session_id: &str,
+        session: StoredOpaqueSession,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        let expires_at = Instant::now().checked_add(ttl).unwrap_or_else(Instant::now);
+        self.sessions.write().await.insert(
+            session_id.to_string(),
+            ExpiringValue {
+                value: session,
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredOpaqueSession>, StoreError> {
+        Ok(Self::get_expiring_value(&self.sessions, session_id, Instant::now()).await)
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<(), StoreError> {
+        self.sessions.write().await.remove(session_id);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -430,6 +598,7 @@ impl RoomStore for RedisRoomStore {
         let now_ms = now_unix_ms();
         let payload = serde_json::to_string(&CreateScriptPayload {
             schema_version: STORE_SCHEMA_VERSION,
+            auth: &room.auth,
             meta: &room.meta,
             envelope: &room.envelope,
         })?;
@@ -464,6 +633,7 @@ impl RoomStore for RedisRoomStore {
                         .expires_at_ms
                         .ok_or(StoreError::ScriptProtocol("missing created expires_at_ms"))?,
                     content_version: room.envelope.version,
+                    auth: room.auth,
                     meta: room.meta,
                     envelope: room.envelope,
                 })
@@ -496,6 +666,13 @@ impl RoomStore for RedisRoomStore {
                     .and_then(|record| self.normalize_record(record))
             })
             .transpose()
+    }
+
+    async fn get_registration(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<StoredOpaqueRegistration>, StoreError> {
+        Ok(self.get(room_id).await?.map(|record| record.auth))
     }
 
     async fn update(
@@ -554,6 +731,94 @@ impl RoomStore for RedisRoomStore {
             )),
         }
     }
+
+    async fn put_login_state(
+        &self,
+        login_session_id: &str,
+        state: StoredOpaqueLoginState,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection.clone();
+        let key = format!("{}:opaque:login:{login_session_id}", self.key_prefix);
+        let payload = serde_json::to_string(&state)?;
+        redis::cmd("SET")
+            .arg(key)
+            .arg(payload)
+            .arg("PX")
+            .arg(ttl_to_millis(ttl))
+            .query_async::<()>(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    async fn take_login_state(
+        &self,
+        login_session_id: &str,
+    ) -> Result<Option<StoredOpaqueLoginState>, StoreError> {
+        let mut connection = self.connection.clone();
+        let key = format!("{}:opaque:login:{login_session_id}", self.key_prefix);
+        let payload = redis::cmd("GET")
+            .arg(&key)
+            .query_async::<Option<String>>(&mut connection)
+            .await?;
+        redis::cmd("DEL")
+            .arg(&key)
+            .query_async::<()>(&mut connection)
+            .await?;
+
+        payload
+            .map(|json| {
+                serde_json::from_str::<StoredOpaqueLoginState>(&json).map_err(StoreError::from)
+            })
+            .transpose()
+    }
+
+    async fn put_session(
+        &self,
+        session_id: &str,
+        session: StoredOpaqueSession,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection.clone();
+        let key = format!("{}:opaque:session:{session_id}", self.key_prefix);
+        let payload = serde_json::to_string(&session)?;
+        redis::cmd("SET")
+            .arg(key)
+            .arg(payload)
+            .arg("PX")
+            .arg(ttl_to_millis(ttl))
+            .query_async::<()>(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredOpaqueSession>, StoreError> {
+        let mut connection = self.connection.clone();
+        let key = format!("{}:opaque:session:{session_id}", self.key_prefix);
+        let payload = redis::cmd("GET")
+            .arg(key)
+            .query_async::<Option<String>>(&mut connection)
+            .await?;
+
+        payload
+            .map(|json| {
+                serde_json::from_str::<StoredOpaqueSession>(&json).map_err(StoreError::from)
+            })
+            .transpose()
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<(), StoreError> {
+        let mut connection = self.connection.clone();
+        let key = format!("{}:opaque:session:{session_id}", self.key_prefix);
+        redis::cmd("DEL")
+            .arg(key)
+            .query_async::<()>(&mut connection)
+            .await?;
+        Ok(())
+    }
 }
 
 fn ttl_to_millis(ttl: Duration) -> u64 {
@@ -574,11 +839,39 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use std::time::Duration;
 
+    use opaque_ke::{ClientRegistrationFinishParameters, ServerRegistration};
+    use rand::rngs::OsRng;
     use scpy_crypto::{create_room, KdfParams};
 
     use crate::allocator::encode_local_id;
+    use crate::auth::{new_server_setup, OpaqueClientRegistration, StoredOpaqueRegistration};
 
     use super::{FreeRoomResult, MemoryRoomStore, RoomStore, StoreError, StoredRoom};
+
+    fn test_registration(password: &str) -> StoredOpaqueRegistration {
+        let credential_id = b"unit-test-credential".to_vec();
+        let server_setup = new_server_setup();
+        let mut rng = OsRng;
+        let registration_start =
+            OpaqueClientRegistration::start(&mut rng, password.as_bytes()).expect("must start");
+        let registration_response =
+            ServerRegistration::start(&server_setup, registration_start.message, &credential_id)
+                .expect("must build response");
+        let registration_finish = registration_start
+            .state
+            .finish(
+                &mut rng,
+                password.as_bytes(),
+                registration_response.message,
+                ClientRegistrationFinishParameters::default(),
+            )
+            .expect("must finish registration");
+
+        StoredOpaqueRegistration {
+            credential_id,
+            password_file: ServerRegistration::finish(registration_finish.message),
+        }
+    }
 
     #[tokio::test]
     async fn memory_store_evicts_expired_rooms_on_get_and_reuses_their_code() {
@@ -589,6 +882,7 @@ mod tests {
         let first = store
             .create(
                 StoredRoom {
+                    auth: test_registration("password"),
                     meta: created.meta.clone(),
                     envelope: created.envelope.clone(),
                 },
@@ -615,6 +909,7 @@ mod tests {
         let second = store
             .create(
                 StoredRoom {
+                    auth: test_registration("password"),
                     meta: created.meta,
                     envelope: created.envelope,
                 },
@@ -637,6 +932,7 @@ mod tests {
         let record = store
             .create(
                 StoredRoom {
+                    auth: test_registration("password"),
                     meta: created.meta,
                     envelope: created.envelope.clone(),
                 },
